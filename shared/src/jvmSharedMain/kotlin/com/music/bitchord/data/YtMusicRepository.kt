@@ -34,7 +34,9 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.serialization.json.JsonObject
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
@@ -70,6 +72,94 @@ object YtMusicRepository {
      * search, which still has to be measured.
      */
     fun versionTimeMap(fromId: String, toId: String): VersionTimeMap? = versionTimeMaps[fromId to toId]
+
+    /**
+     * Curated feed generated exclusively from approved YouTube Music channel and artist browseIds.
+     * Capped at 3 concurrent Innertube.browse requests via Semaphore to avoid network throttling.
+     */
+    suspend fun curatedHome(): Result<HomeFeed> = call("curatedHome") {
+        val semaphore = Semaphore(3)
+        val channels = CuratedChannelsConfig.APPROVED_CHANNELS
+        coroutineScope {
+            val channelResults = channels.map { channel ->
+                async {
+                    semaphore.withPermit {
+                        runCatching {
+                            val response = Innertube.browse(channel.browseId)
+                            val page = InnertubeParser.parseArtistPage(response, channel.browseId)
+                            channel to page
+                        }.getOrNull()
+                    }
+                }
+            }.awaitAll().filterNotNull()
+
+            val shelves = mutableListOf<HomeShelf>()
+
+            // 1. Curated Spotlight shelf: Top 2 tracks from each approved channel
+            val spotlightItems = channelResults.flatMap { (channel, page) ->
+                page.songs.take(2).map { song ->
+                    CuratedChannelsConfig.recordAllowedTrack(song)
+                    ShelfItem(
+                        title = song.title,
+                        subtitle = song.artist.ifBlank { channel.name },
+                        thumbnailUrl = song.thumbnailUrl,
+                        videoId = song.videoId,
+                        browseId = null,
+                    )
+                }
+            }.distinctBy { it.videoId }
+
+            if (spotlightItems.isNotEmpty()) {
+                shelves += HomeShelf(
+                    title = "Curated Spotlight",
+                    items = spotlightItems,
+                    subtitle = "Official releases from approved artists & labels",
+                    layout = com.music.bitchord.data.model.ShelfLayout.LIST,
+                )
+            }
+
+            // 2. Individual channel shelves
+            channelResults.forEach { (channel, page) ->
+                val channelSongItems = page.songs.take(6).map { song ->
+                    CuratedChannelsConfig.recordAllowedTrack(song)
+                    ShelfItem(
+                        title = song.title,
+                        subtitle = song.artist.ifBlank { channel.name },
+                        thumbnailUrl = song.thumbnailUrl,
+                        videoId = song.videoId,
+                        browseId = null,
+                    )
+                }
+                val channelSectionItems = page.sections.flatMap { it.items }.take(6)
+                val combined = (channelSongItems + channelSectionItems).distinctBy { it.videoId ?: it.browseId }
+                if (combined.isNotEmpty()) {
+                    shelves += HomeShelf(
+                        title = "${channel.name} — Releases",
+                        items = combined,
+                        moreBrowseId = channel.browseId,
+                        layout = com.music.bitchord.data.model.ShelfLayout.CARDS,
+                    )
+                }
+            }
+
+            // 3. Consolidated Curated Albums & Singles
+            val allAlbums = channelResults.flatMap { (_, page) ->
+                page.sections.filter {
+                    it.title.contains("album", ignoreCase = true) || it.title.contains("single", ignoreCase = true)
+                }.flatMap { it.items }
+            }.distinctBy { it.browseId }.take(20)
+
+            if (allAlbums.isNotEmpty()) {
+                shelves += HomeShelf(
+                    title = "Curated Albums & Singles",
+                    items = allAlbums,
+                    layout = com.music.bitchord.data.model.ShelfLayout.CARDS,
+                )
+            }
+
+            HomeFeed(shelves, continuation = null)
+        }
+    }
 
     /**
      * The core personalised feed. It stays deliberately independent from the
@@ -132,7 +222,10 @@ object YtMusicRepository {
             emptyList()
         }
 
-        val allSongs = ytSongs.distinctBy { it.videoId }.take(RECENT_LIMIT)
+        val allSongs = ytSongs
+            .filter { CuratedChannelsConfig.isAllowedSong(it) }
+            .distinctBy { it.videoId }
+            .take(RECENT_LIMIT)
         if (allSongs.isEmpty()) return null
         return HomeShelf(
             title = RECENT_TITLE,
@@ -188,7 +281,10 @@ object YtMusicRepository {
     suspend fun recents(): Result<List<Song>> = call("recents") {
         if (Innertube.cookie != null) {
             val history = runCatching { fetchHistory() }.getOrDefault(emptyList())
-            if (history.isNotEmpty()) return@call history
+            val filtered = if (CuratedChannelsConfig.isCuratedModeEnabled) {
+                history.filter { CuratedChannelsConfig.isAllowedSong(it) }
+            } else history
+            if (filtered.isNotEmpty()) return@call filtered
         }
         emptyList()
     }
@@ -343,7 +439,16 @@ object YtMusicRepository {
                 Innertube.search(query, filter.params, anonymous),
                 includeVideos = filter == SearchFilter.VIDEOS,
             ).let { page ->
-                SearchPage(page.rows.distinctBy { it.identityKey() }, page.continuation)
+                val filteredRows = if (CuratedChannelsConfig.isCuratedModeEnabled) {
+                    page.rows.filter { row ->
+                        when (row) {
+                            is SearchResult.TopTrack -> CuratedChannelsConfig.isAllowedSong(row.song)
+                            is SearchResult.Track -> CuratedChannelsConfig.isAllowedSong(row.song)
+                            is SearchResult.Browse -> CuratedChannelsConfig.isAllowedBrowseItem(row.item)
+                        }
+                    }
+                } else page.rows
+                SearchPage(filteredRows.distinctBy { it.identityKey() }, page.continuation)
             }
         }
 
@@ -353,7 +458,16 @@ object YtMusicRepository {
             Innertube.searchContinuation(token),
             includeVideos = filter == SearchFilter.VIDEOS,
         ).let { page ->
-            SearchPage(page.rows.distinctBy { it.identityKey() }, page.continuation)
+            val filteredRows = if (CuratedChannelsConfig.isCuratedModeEnabled) {
+                page.rows.filter { row ->
+                    when (row) {
+                        is SearchResult.TopTrack -> CuratedChannelsConfig.isAllowedSong(row.song)
+                        is SearchResult.Track -> CuratedChannelsConfig.isAllowedSong(row.song)
+                        is SearchResult.Browse -> CuratedChannelsConfig.isAllowedBrowseItem(row.item)
+                    }
+                }
+            } else page.rows
+            SearchPage(filteredRows.distinctBy { it.identityKey() }, page.continuation)
         }
     }
 
@@ -400,12 +514,32 @@ object YtMusicRepository {
         call("typeahead:$input") {
             val cards = InnertubeParser.parseSearchSuggestionEntities(Innertube.searchSuggestions(input))
                 .distinctBy { it.identityKey() }
+                .let { list ->
+                    if (CuratedChannelsConfig.isCuratedModeEnabled) {
+                        list.filter { row ->
+                            when (row) {
+                                is SearchResult.TopTrack -> CuratedChannelsConfig.isAllowedSong(row.song)
+                                is SearchResult.Track -> CuratedChannelsConfig.isAllowedSong(row.song)
+                                is SearchResult.Browse -> CuratedChannelsConfig.isAllowedBrowseItem(row.item)
+                            }
+                        }
+                    } else list
+                }
             if (cards.isNotEmpty()) return@call SearchPage(cards, continuation = null)
             InnertubeParser.parseSearchPage(
                 Innertube.searchTypeahead(input),
                 includeVideos = false,
             ).let { page ->
-                SearchPage(page.rows.distinctBy { it.identityKey() }, page.continuation)
+                val filteredRows = if (CuratedChannelsConfig.isCuratedModeEnabled) {
+                    page.rows.filter { row ->
+                        when (row) {
+                            is SearchResult.TopTrack -> CuratedChannelsConfig.isAllowedSong(row.song)
+                            is SearchResult.Track -> CuratedChannelsConfig.isAllowedSong(row.song)
+                            is SearchResult.Browse -> CuratedChannelsConfig.isAllowedBrowseItem(row.item)
+                        }
+                    }
+                } else page.rows
+                SearchPage(filteredRows.distinctBy { it.identityKey() }, page.continuation)
             }
         }
 
@@ -655,7 +789,12 @@ object YtMusicRepository {
      */
     suspend fun radio(videoId: String, preferVideo: Boolean = false): Result<List<Song>> =
         call("radio:$videoId:$preferVideo") {
-            InnertubeParser.parseWatchQueue(Innertube.next(videoId), preferVideo = preferVideo)
+            val songs = InnertubeParser.parseWatchQueue(Innertube.next(videoId), preferVideo = preferVideo)
+            if (CuratedChannelsConfig.isCuratedModeEnabled) {
+                songs.filter { CuratedChannelsConfig.isAllowedSong(it) }
+            } else {
+                songs
+            }
         }
 
     /**
@@ -1133,7 +1272,7 @@ object YtMusicRepository {
      * their complete discography.
      */
     suspend fun artistPage(browseId: String): Result<ArtistPage> = call("artist:$browseId") {
-        val page = InnertubeParser.parseArtistPage(Innertube.browse(browseId))
+        val page = InnertubeParser.parseArtistPage(Innertube.browse(browseId), browseId)
         coroutineScope {
             val fullSongsDeferred = async {
                 page.moreSongsBrowseId?.let { playlistId ->
@@ -1171,7 +1310,7 @@ object YtMusicRepository {
      * shelf.
      */
     suspend fun artistLanding(browseId: String): Result<ArtistPage> = call("artistLanding:$browseId") {
-        InnertubeParser.parseArtistPage(Innertube.browse(browseId))
+        InnertubeParser.parseArtistPage(Innertube.browse(browseId), browseId)
     }
 
     /**

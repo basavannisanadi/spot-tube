@@ -2,6 +2,7 @@ package com.music.bitchord.data.sources
 
 import android.net.Uri
 import android.util.Log
+import com.music.bitchord.data.CuratedChannelsConfig
 import com.music.bitchord.data.TrackLog
 import com.music.bitchord.data.model.Song
 import com.music.bitchord.data.settings.AppSettings
@@ -290,7 +291,11 @@ object SourceResolver {
         if (target.title.isBlank() || target.isVideo) return null
         val active = SourceRegistry.activeForPlayback()
         val youtube = active.firstOrNull { it.kind == SourceKind.YOUTUBE } ?: return null
-        val request = requestForNow()
+        val request = if (CuratedChannelsConfig.isCuratedModeEnabled && CuratedChannelsConfig.isCuratedTrack(target.title, target.artist)) {
+            StreamRequest.Lossless
+        } else {
+            requestForNow()
+        }
         val (source, stream) = bestAcross(rankedAbove(youtube.configId, active), target, request)
             ?: return null
         // Says what was found, not what the caller will do with it. This

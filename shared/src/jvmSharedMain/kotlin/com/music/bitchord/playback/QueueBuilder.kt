@@ -1,5 +1,6 @@
 package com.music.bitchord.playback
 
+import com.music.bitchord.data.CuratedChannelsConfig
 import com.music.bitchord.data.model.Song
 import java.util.Locale
 
@@ -60,6 +61,7 @@ object QueueBuilder {
 
         for (candidate in ordered) {
             if (out.size >= limit) break
+            if (CuratedChannelsConfig.isCuratedModeEnabled && !CuratedChannelsConfig.isAllowedSong(candidate)) continue
             if (taken.any { isSameRecording(it, candidate) }) continue
 
             val artists = artistSet(candidate.artist)

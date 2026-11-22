@@ -1,5 +1,6 @@
 package com.music.bitchord.data.innertube
 
+import com.music.bitchord.data.CuratedChannelsConfig
 import com.music.bitchord.data.MonotonicClock
 import com.music.bitchord.data.TrackLog
 import com.music.bitchord.data.Http
@@ -757,8 +758,10 @@ object StreamResolver {
      * everything is above it (e.g. Low on a track that only has 130kbps+), take
      * the cheapest available rather than failing.
      */
-    private fun <T> pickForQuality(candidates: List<Pair<Int, T>>): T? =
-        underCeiling(candidates, maxKbps())
+    private fun <T> pickForQuality(candidates: List<Pair<Int, T>>): T? {
+        val ceiling = if (CuratedChannelsConfig.isCuratedModeEnabled) Int.MAX_VALUE else maxKbps()
+        return underCeiling(candidates, ceiling)
+    }
 
     /**
      * Highest of [candidates] at or under [maxKbps]; if everything is above it

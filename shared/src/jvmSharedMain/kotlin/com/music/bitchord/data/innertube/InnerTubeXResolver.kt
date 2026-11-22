@@ -1,5 +1,6 @@
 package com.music.bitchord.data.innertube
 
+import com.music.bitchord.data.CuratedChannelsConfig
 import com.music.bitchord.data.MonotonicClock
 import com.metrolist.innertubex.InnerTube
 import com.metrolist.innertubex.InnerTubeLogLevel
@@ -252,6 +253,7 @@ object InnerTubeXResolver {
             excludedClients = excludedFor(videoId) + skipClients,
             audioQuality = when {
                 requireM4a -> AudioQuality.MP4
+                CuratedChannelsConfig.isCuratedModeEnabled && CuratedChannelsConfig.isCuratedVideoId(videoId) -> AudioQuality.HIGH
                 maxKbps <= LOW_KBPS -> AudioQuality.LOW
                 premiumOpus -> AudioQuality.HIGH
                 else -> AudioQuality.AUTO

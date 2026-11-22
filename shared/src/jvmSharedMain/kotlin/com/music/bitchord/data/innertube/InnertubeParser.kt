@@ -30,6 +30,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
+import com.music.bitchord.data.CuratedChannelsConfig
 import java.util.Locale
 
 /**
@@ -333,7 +334,7 @@ object InnertubeParser {
      * links to a playlist with the full list) plus carousels for Albums,
      * Singles & EPs and friends.
      */
-    fun parseArtistPage(response: JsonObject): ArtistPage {
+    fun parseArtistPage(response: JsonObject, browseId: String? = null): ArtistPage {
         val sections = response.o("contents")
             .o("singleColumnBrowseResultsRenderer").a("tabs")?.firstOrNull()
             .o("tabRenderer").o("content").o("sectionListRenderer").a("contents")
@@ -343,9 +344,17 @@ object InnertubeParser {
         var moreSongs: String? = null
         val shelves = mutableListOf<HomeShelf>()
         val header = response["header"]
+        val channelId = subscription(header)?.channelId ?: browseId
+        val artistTitle = artistName(header)
         // "Top songs" rows are billed by the page they sit on: the subtitle
         // beside them counts plays where a search row names the artist.
-        val credit = Credits(artistName = artistName(header))
+        val credit = Credits(
+            artistName = artistTitle,
+            artistId = channelId,
+            artists = if (channelId != null && artistTitle != null) {
+                listOf(ArtistRef(name = artistTitle, browseId = channelId))
+            } else emptyList(),
+        )
 
         sections.forEach { section ->
             section.o("musicShelfRenderer")?.let { shelf ->
@@ -757,7 +766,7 @@ object InnertubeParser {
         val thumbnails = renderer.o("thumbnail").o("musicThumbnailRenderer")
             .o("thumbnail").a("thumbnails")
 
-        return Song(
+        val parsedSong = Song(
             videoId = videoId,
             title = title,
             // Preserve the whole artist segment even when only some of its
@@ -790,6 +799,10 @@ object InnertubeParser {
             // Extract the "Remove from history" feedback token from the row's menu, if present.
             feedbackToken = extractFeedbackToken(renderer),
         )
+        if (CuratedChannelsConfig.isCuratedModeEnabled && CuratedChannelsConfig.isAllowedSong(parsedSong)) {
+            CuratedChannelsConfig.recordAllowedTrack(parsedSong)
+        }
+        return parsedSong
     }
 
     /**

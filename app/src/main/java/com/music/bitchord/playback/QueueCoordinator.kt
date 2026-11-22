@@ -1,6 +1,7 @@
 package com.music.bitchord.playback
 
 import androidx.media3.common.Player
+import com.music.bitchord.data.CuratedChannelsConfig
 import com.music.bitchord.data.listentogether.PartyTrack
 import com.music.bitchord.data.model.QueueTier
 import com.music.bitchord.data.model.Song
@@ -32,9 +33,21 @@ object QueueCoordinator {
         newContextSongs: List<Song>,
         selectedIndex: Int,
         contextSource: QueueSource,
-    ): ContextQueueResult = QueueTimeline.buildContextQueue(
-        currentTimeline, currentIndex, newContextSongs, selectedIndex, contextSource,
-    )
+    ): ContextQueueResult {
+        val allowedContext = if (CuratedChannelsConfig.isCuratedModeEnabled) {
+            val filtered = newContextSongs.filter { CuratedChannelsConfig.isAllowedSong(it) }
+            if (filtered.isEmpty()) newContextSongs else filtered
+        } else newContextSongs
+        val adjustedIndex = if (allowedContext.size != newContextSongs.size) {
+            val selectedSong = newContextSongs.getOrNull(selectedIndex)
+            if (selectedSong != null) {
+                allowedContext.indexOfFirst { it.videoId == selectedSong.videoId }.coerceAtLeast(0)
+            } else 0
+        } else selectedIndex
+        return QueueTimeline.buildContextQueue(
+            currentTimeline, currentIndex, allowedContext, adjustedIndex, contextSource,
+        )
+    }
 
     /** @see QueueTimeline.buildOneOffQueue */
     fun buildOneOffQueue(
@@ -42,18 +55,31 @@ object QueueCoordinator {
         currentIndex: Int,
         tappedSong: Song,
         source: QueueSource,
-    ): List<Song> = QueueTimeline.buildOneOffQueue(currentTimeline, currentIndex, tappedSong, source)
+    ): List<Song> {
+        if (CuratedChannelsConfig.isCuratedModeEnabled && !CuratedChannelsConfig.isAllowedSong(tappedSong)) {
+            return currentTimeline
+        }
+        return QueueTimeline.buildOneOffQueue(currentTimeline, currentIndex, tappedSong, source)
+    }
 
     /** @see QueueTimeline.buildPartyPlaybackQueue */
     fun buildPartyPlaybackQueue(
         tappedSong: Song,
         source: QueueSource,
         upcomingPartyTracks: List<PartyTrack>,
-    ): List<Song> = QueueTimeline.buildPartyPlaybackQueue(
-        tappedSong,
-        source,
-        upcomingPartyTracks.map { it.toSong() },
-    )
+    ): List<Song> {
+        if (CuratedChannelsConfig.isCuratedModeEnabled && !CuratedChannelsConfig.isAllowedSong(tappedSong)) {
+            return emptyList()
+        }
+        val allowedParty = if (CuratedChannelsConfig.isCuratedModeEnabled) {
+            upcomingPartyTracks.filter { CuratedChannelsConfig.isAllowedSong(it.toSong()) }
+        } else upcomingPartyTracks
+        return QueueTimeline.buildPartyPlaybackQueue(
+            tappedSong,
+            source,
+            allowedParty.map { it.toSong() },
+        )
+    }
 
     /** @see QueueTimeline.findUserQueueInsertionIndex */
     fun findUserQueueInsertionIndex(

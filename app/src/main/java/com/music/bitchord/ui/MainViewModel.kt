@@ -12,6 +12,7 @@ import com.music.bitchord.auth.profileId
 import com.music.bitchord.auth.sessionId
 import com.music.bitchord.auth.adjacentProfile
 import com.music.bitchord.data.AppUpdateChecker
+import com.music.bitchord.data.CuratedChannelsConfig
 import com.music.bitchord.data.LocalMediaRepository
 import com.music.bitchord.data.LikeState
 import com.music.bitchord.data.YtMusicRepository
@@ -1860,6 +1861,43 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         homeSeenTitles.clear()
         _homeLoadingMore.value = false
         _homeRecentlyPlayedLoading.value = _signedIn.value
+
+        if (CuratedChannelsConfig.isCuratedModeEnabled) {
+            _homePendingShelves.value = 1
+            viewModelScope.launch {
+                try {
+                    YtMusicRepository.curatedHome()
+                        .onSuccess { feed ->
+                            if (!isCurrentHomeLoad(identity, generation)) return@onSuccess
+                            homeContinuation = null
+                            publishHomeShelves(feed.shelves)
+                        }
+                        .onFailure { failure ->
+                            if (isCurrentHomeLoad(identity, generation) && _home.value !is UiState.Success) {
+                                _home.value = UiState.Error(failure.friendly())
+                            }
+                        }
+                } finally {
+                    homeShelfRequestSettled(identity, generation)
+                }
+                if (_signedIn.value) {
+                    launch {
+                        YtMusicRepository.homeRecentlyPlayed()
+                            .onSuccess { shelf ->
+                                if (isCurrentHomeLoad(identity, generation)) {
+                                    _homeRecentlyPlayedLoading.value = false
+                                    shelf?.let { publishHomeShelves(listOf(it), prepend = true) }
+                                }
+                            }
+                            .onFailure {
+                                if (isCurrentHomeLoad(identity, generation)) _homeRecentlyPlayedLoading.value = false
+                            }
+                    }
+                }
+            }
+            return
+        }
+
         // The core feed plus one browse per supplement. Recently played is left
         // out: it has its own skeleton at the head of the page rather than the
         // one at the tail.
@@ -2031,6 +2069,21 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     /** Refreshes the core feed without blanking the current Play page first. */
     private suspend fun refreshHome(identity: String?) = coroutineScope {
         val recent = if (_signedIn.value) async { YtMusicRepository.homeRecentlyPlayed() } else null
+        if (CuratedChannelsConfig.isCuratedModeEnabled) {
+            YtMusicRepository.curatedHome().onSuccess { feed ->
+                if (identity != listenerKey()) return@onSuccess
+                homeContinuation = null
+                homeSeenTitles.clear()
+                val shelves = feed.shelves.withoutRepeatsOf(emptyList())
+                    .filter { homeSeenTitles.add(it.title.lowercase(Locale.ROOT)) }
+                if (shelves.isNotEmpty()) _home.value = UiState.Success(shelves)
+            }
+            recent?.await()?.onSuccess { shelf ->
+                if (identity == listenerKey()) shelf?.let { publishHomeShelves(listOf(it), prepend = true) }
+            }
+            return@coroutineScope
+        }
+
         // Top Picks keeps to its hour; a pull refreshes the feed, not the
         // picks, unless the hour has already turned over.
         if (topPicksJob?.isActive != true) loadTopPicks(identity, rebuild = false)

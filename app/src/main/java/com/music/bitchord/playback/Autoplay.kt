@@ -1,5 +1,6 @@
 package com.music.bitchord.playback
 
+import com.music.bitchord.data.CuratedChannelsConfig
 import com.music.bitchord.data.YtMusicRepository
 import com.music.bitchord.data.listentogether.ListenTogether
 import com.music.bitchord.data.model.SearchFilter
@@ -106,7 +107,18 @@ suspend fun loadAutoplayTracks(
     // they would only be converted again, when the station's songs are the answer.
     val videos = seedSong.isVideo && seed == seedSong.videoId && !MusicOnlyPlayback.isActive()
     val related = YtMusicRepository.radio(seed, preferVideo = videos).getOrElse { return Result.failure(it) }
-    val extra = QueueBuilder.extend(existing, related, limit, preferVideos = videos)
+    val allowedRelated = if (CuratedChannelsConfig.isCuratedModeEnabled) {
+        related.filter { CuratedChannelsConfig.isAllowedSong(it) }
+    } else related
+
+    val candidates = if (CuratedChannelsConfig.isCuratedModeEnabled && allowedRelated.size < limit) {
+        val fallbackTracks = CuratedChannelsConfig.getCuratedFallbackTracks(limit)
+        (allowedRelated + fallbackTracks).distinctBy { it.videoId }
+    } else {
+        allowedRelated
+    }
+
+    val extra = QueueBuilder.extend(existing, candidates, limit, preferVideos = videos)
     if (extra.isEmpty()) return Result.success(emptyList())
 
     return Result.success(extra.map {
